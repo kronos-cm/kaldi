@@ -23,6 +23,8 @@
 #include "nnet3/nnet-simple-component.h"
 #include "nnet3/nnet-general-component.h"
 #include "nnet3/nnet-parse.h"
+#include "nnet3/nnet-computation-graph.h"
+#include "nnet3/nnet-diagnostics.h"
 
 namespace kaldi {
 namespace nnet3 {
@@ -57,10 +59,9 @@ bool IsSimpleNnet(const Nnet &nnet) {
   // "input" and everything checks out.
   if (NumInputNodes(nnet) == 1)
     return true;
-  // Otherwise, there should be 2 inputs and one
+  // Otherwise, there should be input node with name "input" and one
   // should be called "ivector".
-  return NumInputNodes(nnet) == 2 &&
-      nnet.GetNodeIndex("ivector") != -1 &&
+  return nnet.GetNodeIndex("ivector") != -1 &&
       nnet.IsInputNode(nnet.GetNodeIndex("ivector"));
 }
 
@@ -393,6 +394,21 @@ int32 NumUpdatableComponents(const Nnet &dest) {
   return ans;
 }
 
+void FreezeNaturalGradient(bool freeze, Nnet *nnet) {
+  for (int32 c = 0; c < nnet->NumComponents(); c++) {
+    Component *comp = nnet->GetComponent(c);
+    if (comp->Properties() & kUpdatableComponent) {
+      // For now all updatable components inherit from class UpdatableComponent.
+      // If that changes in future, we will change this code.
+      UpdatableComponent *uc = dynamic_cast<UpdatableComponent*>(comp);
+      if (uc == NULL)
+        KALDI_ERR << "Updatable component does not inherit from class "
+            "UpdatableComponent; change this code.";
+      uc->FreezeNaturalGradient(freeze);
+    }
+  }
+}
+
 void ConvertRepeatedToBlockAffine(CompositeComponent *c_component) {
   for(int32 i = 0; i < c_component->NumComponents(); i++) {
     const Component *c = c_component->GetComponent(i);
@@ -466,6 +482,58 @@ void SetDropoutProportion(BaseFloat dropout_proportion,
         dynamic_cast<DropoutMaskComponent*>(nnet->GetComponent(c));
     if (mc != NULL)
       mc->SetDropoutProportion(dropout_proportion);
+  }
+}
+
+bool HasBatchnorm(const Nnet &nnet) {
+  for (int32 c = 0; c < nnet.NumComponents(); c++) {
+    const Component *comp = nnet.GetComponent(c);
+    const BatchNormComponent *bc =
+        dynamic_cast<const BatchNormComponent*>(comp);
+    if (bc != NULL)
+      return true;
+  }
+  return false;
+}
+
+void RecomputeStats(const std::vector<NnetExample> &egs, Nnet *nnet) {
+  KALDI_LOG << "Recomputing stats on nnet (affects batch-norm)";
+  ZeroComponentStats(nnet);
+  NnetComputeProbOptions opts;
+  opts.store_component_stats = true;
+  NnetComputeProb prob_computer(opts, nnet);
+  for (size_t i = 0; i < egs.size(); i++)
+    prob_computer.Compute(egs[i]);
+  prob_computer.PrintTotalStats();
+  KALDI_LOG << "Done recomputing stats.";
+}
+
+
+
+void SetBatchnormTestMode(bool test_mode,  Nnet *nnet) {
+  for (int32 c = 0; c < nnet->NumComponents(); c++) {
+    Component *comp = nnet->GetComponent(c);
+    BatchNormComponent *bc = dynamic_cast<BatchNormComponent*>(comp);
+    if (bc != NULL)
+      bc->SetTestMode(test_mode);
+  }
+}
+
+void SetDropoutTestMode(bool test_mode,  Nnet *nnet) {
+  for (int32 c = 0; c < nnet->NumComponents(); c++) {
+    Component *comp = nnet->GetComponent(c);
+    RandomComponent *rc = dynamic_cast<RandomComponent*>(comp);
+    if (rc != NULL)
+      rc->SetTestMode(test_mode);
+  }
+}
+
+void ResetGenerators(Nnet *nnet){
+  for (int32 c = 0; c < nnet->NumComponents(); c++) {
+    Component *comp = nnet->GetComponent(c);
+    RandomComponent *rc = dynamic_cast<RandomComponent*>(comp);
+    if (rc != NULL)
+      rc->ResetGenerator();
   }
 }
 
@@ -672,7 +740,97 @@ bool NnetIsRecurrent(const Nnet &nnet) {
   return GraphHasCycles(graph);
 }
 
-
+bool UpdateNnetWithMaxChange(const Nnet &delta_nnet,
+                             BaseFloat max_param_change,
+                             BaseFloat max_change_scale,
+                             BaseFloat scale, Nnet *nnet,
+                             std::vector<int32> *
+                             num_max_change_per_component_applied,
+                             int32 *num_max_change_global_applied) {
+  KALDI_ASSERT(nnet != NULL);
+  // computes scaling factors for per-component max-change
+  const int32 num_updatable = NumUpdatableComponents(delta_nnet);
+  Vector<BaseFloat> scale_factors = Vector<BaseFloat>(num_updatable);
+  BaseFloat param_delta_squared = 0.0;
+  int32 num_max_change_per_component_applied_per_minibatch = 0;
+  BaseFloat min_scale = 1.0;
+  std::string component_name_with_min_scale;
+  BaseFloat max_change_with_min_scale;
+  int32 i = 0;
+  for (int32 c = 0; c < delta_nnet.NumComponents(); c++) {
+    const Component *comp = delta_nnet.GetComponent(c);
+    if (comp->Properties() & kUpdatableComponent) {
+      const UpdatableComponent *uc =
+          dynamic_cast<const UpdatableComponent*>(comp);
+      if (uc == NULL)
+        KALDI_ERR << "Updatable component does not inherit from class "
+                  << "UpdatableComponent; change this code.";
+      BaseFloat max_param_change_per_comp = uc->MaxChange();
+      KALDI_ASSERT(max_param_change_per_comp >= 0.0);
+      BaseFloat dot_prod = uc->DotProduct(*uc);
+      if (max_param_change_per_comp != 0.0 &&
+          std::sqrt(dot_prod) * std::abs(scale) >
+          max_param_change_per_comp * max_change_scale) {
+        scale_factors(i) = max_param_change_per_comp * max_change_scale /
+            (std::sqrt(dot_prod) * std::abs(scale));
+        (*num_max_change_per_component_applied)[i]++;
+        num_max_change_per_component_applied_per_minibatch++;
+        KALDI_VLOG(2) << "Parameters in " << delta_nnet.GetComponentName(c)
+                      << " change too big: " << std::sqrt(dot_prod) << " * "
+                      << scale << " > " << "max-change * max-change-scale="
+                      << max_param_change_per_comp << " * " << max_change_scale
+                      << ", scaling by " << scale_factors(i);
+      } else {
+        scale_factors(i) = 1.0;
+      }
+      if (i == 0 || scale_factors(i) < min_scale) {
+        min_scale =  scale_factors(i);
+        component_name_with_min_scale = delta_nnet.GetComponentName(c);
+        max_change_with_min_scale = max_param_change_per_comp;
+      }
+      param_delta_squared += std::pow(scale_factors(i),
+                                      static_cast<BaseFloat>(2.0)) * dot_prod;
+      i++;
+    }
+  }
+  KALDI_ASSERT(i == scale_factors.Dim());
+  BaseFloat param_delta = std::sqrt(param_delta_squared);
+  // computes the scale for global max-change
+  param_delta *= std::abs(scale);
+  if (max_param_change != 0.0) {
+    if (param_delta > max_param_change * max_change_scale) {
+      if (param_delta - param_delta != 0.0) {
+        KALDI_WARN << "Infinite parameter change, will not apply.";
+        return false;
+      } else {
+        scale *= max_param_change * max_change_scale / param_delta;
+        (*num_max_change_global_applied)++;
+      }
+    }
+  }
+  if ((max_param_change != 0.0 &&
+      param_delta > max_param_change * max_change_scale &&
+      param_delta - param_delta == 0.0) || min_scale < 1.0) {
+    std::ostringstream ostr;
+    if (min_scale < 1.0)
+      ostr << "Per-component max-change active on "
+           << num_max_change_per_component_applied_per_minibatch
+           << " / " << num_updatable << " Updatable Components."
+           << "(smallest factor=" << min_scale << " on "
+           << component_name_with_min_scale
+           << " with max-change=" << max_change_with_min_scale <<"). ";
+    if (param_delta > max_param_change * max_change_scale)
+      ostr << "Global max-change factor was "
+           << max_param_change * max_change_scale / param_delta
+           << " with max-change=" << max_param_change << ".";
+    KALDI_LOG << ostr.str();
+  }
+  // applies both of the max-change scalings all at once, component by component
+  // and updates parameters
+  scale_factors.Scale(scale);
+  AddNnetComponents(delta_nnet, scale_factors, scale, nnet);
+  return true;
+}
 
 } // namespace nnet3
 } // namespace kaldi
